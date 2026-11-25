@@ -203,53 +203,120 @@ st.caption(
     "и **какие типы ставок сливают**. Всё остальное — детали."
 )
 
-uploaded = st.file_uploader(
-    "Файл со ставками (.xlsx по шаблону)",
+uploaded_files = st.file_uploader(
+    "Файлы со ставками (.xlsx) — можно сразу несколько дней",
     type=["xlsx"],
-    help="Excel с листом 'Ставки' стандартной структуры. Шаблон — template_stavki.xlsx",
+    accept_multiple_files=True,
+    help=(
+        "Кидай один файл или сразу несколько дневных экспортов из бота — "
+        "дашборд склеит их в одну таблицу и уберёт дубли."
+    ),
 )
 
-if not uploaded:
+if not uploaded_files:
     st.info(
-        "👆 Загрузи файл, чтобы увидеть аналитику. "
-        "Используй шаблон `template_stavki.xlsx` — он гарантирует, что всё заработает."
+        "👆 Загрузи один или несколько файлов, чтобы увидеть аналитику. "
+        "Дневные экспорты из бота (/export) можно кидать пачкой — склеятся в месяц."
     )
     with st.expander("📋 Что должно быть в файле"):
         st.markdown(
             f"**Лист:** `Ставки`\n\n"
-            f"**Обязательные колонки:** {', '.join(f'`{c}`' for c in REQUIRED_COLUMNS)}\n\n"
+            f"**Обязательные колонки:** {', '.join(f'`{c}`' for c in REQUIRED_IN_FILE)}\n\n"
             f"**Опциональные:** {', '.join(f'`{c}`' for c in OPTIONAL_COLUMNS)}"
         )
     st.stop()
 
-df_all, total_rows, dropped_rows = load_data(uploaded.getvalue())
-ok, missing = validate_columns(df_all)
-if not ok:
-    st.error(f"❌ В файле не хватает обязательных колонок: {', '.join(missing)}")
-    st.info(
-        "**Колонки, которые есть в загруженном файле:**\n\n"
-        + ", ".join(f"`{c}`" for c in df_all.columns)
-    )
+# ------------------------------------------------------------
+# Читаем каждый файл отдельно, плохие пропускаем с предупреждением
+# ------------------------------------------------------------
+# Сортируем по имени: у экспортов из бота имя stavki_ГГГГ-ММ-ДД_ЧЧ-ММ.xlsx,
+# значит сортировка по имени = сортировка по времени. При дублях побеждает
+# более поздний файл (например, ставка была PENDING, потом стала WIN).
+uploaded_files = sorted(uploaded_files, key=lambda f: f.name)
+
+frames = []
+file_report = []  # (имя, строк, статус)
+for f in uploaded_files:
+    try:
+        part, total_rows, dropped_rows = load_data(f.getvalue())
+    except Exception as e:
+        file_report.append((f.name, 0, f"❌ не прочитался: {e}"))
+        continue
+
+    ok, missing = validate_columns(part)
+    if not ok:
+        file_report.append((f.name, 0, f"❌ нет колонок: {', '.join(missing)}"))
+        continue
+
+    status = "✅"
+    if dropped_rows:
+        status = f"⚠️ отброшено {dropped_rows} строк без даты"
+    part["_файл"] = f.name
+    frames.append(part)
+    file_report.append((f.name, len(part), status))
+
+if not frames:
+    st.error("Ни один файл не подошёл для анализа.")
+    for name, n, status in file_report:
+        st.caption(f"`{name}` — {status}")
     st.caption(
-        "💡 Названия колонок должны точно совпадать (на русском, в нижнем регистре). "
-        "Проверь что нет лишних пробелов или другого написания. "
-        "Самый надёжный способ получить правильный файл — экспорт через бота (/export)."
+        "💡 Самый надёжный способ получить правильный файл — экспорт через бота (/export)."
     )
     st.stop()
 
-# Диагностика загрузки — если что-то отвалилось при загрузке, сразу видно
-if dropped_rows > 0:
-    st.warning(
-        f"⚠️ Из {total_rows} строк в файле {dropped_rows} отброшено "
-        f"(пустая дата). Осталось {len(df_all)} строк для анализа."
-    )
+df_all = pd.concat(frames, ignore_index=True)
+
+# ------------------------------------------------------------
+# Дедупликация. Если один и тот же день выгружен дважды — строки совпадут.
+# Результат в ключ НЕ входит: если между выгрузками ставка рассчиталась
+# (PENDING → WIN), это та же ставка, оставляем версию из более позднего файла.
+# ------------------------------------------------------------
+DEDUP_KEY = [c for c in ["дата", "канал", "матч", "тип_ставки", "направление",
+                         "линия", "ставка", "кэф", "период"] if c in df_all.columns]
+n_before = len(df_all)
+df_all = df_all.drop_duplicates(subset=DEDUP_KEY, keep="last").reset_index(drop=True)
+n_dupes = n_before - len(df_all)
+
+# Сводка по загрузке — показываем, только если файлов больше одного
+# или что-то пошло не так
+if len(uploaded_files) > 1 or any(s != "✅" for _, _, s in file_report):
+    with st.expander(
+        f"📂 Загружено файлов: {len(frames)} из {len(uploaded_files)} · "
+        f"ставок: {len(df_all)}"
+        + (f" · дублей убрано: {n_dupes}" if n_dupes else ""),
+        expanded=any(s != "✅" for _, _, s in file_report),
+    ):
+        for name, n, status in file_report:
+            st.caption(f"`{name}` — {n} ставок · {status}")
+        if n_dupes:
+            st.caption(
+                f"🔁 {n_dupes} строк совпали между файлами (тот же день выгружен дважды) — "
+                "оставлена версия из более позднего файла."
+            )
 
 if len(df_all) == 0:
-    st.error(
-        f"В файле {total_rows} строк, но **ни одна** не подходит для анализа "
-        "(у всех пустая или невалидная дата). Проверь файл."
-    )
+    st.error("В загруженных файлах нет ни одной ставки с валидной датой.")
     st.stop()
+
+# ------------------------------------------------------------
+# Кнопка «скачать склеенный файл» — чтобы хранить месяц одним xlsx
+# ------------------------------------------------------------
+if len(frames) > 1:
+    _export = df_all.drop(columns=["_файл"]).sort_values("дата").copy()
+    _export["дата"] = _export["дата"].dt.strftime("%Y-%m-%d")
+    _d_min = df_all["дата"].min().strftime("%Y-%m-%d")
+    _d_max = df_all["дата"].max().strftime("%Y-%m-%d")
+    _buf = io.BytesIO()
+    with pd.ExcelWriter(_buf, engine="openpyxl") as _w:
+        _export.to_excel(_w, sheet_name="Ставки", index=False)
+    st.download_button(
+        f"💾 Скачать склеенный файл ({_d_min} — {_d_max}, {len(_export)} ставок)",
+        data=_buf.getvalue(),
+        file_name=f"stavki_{_d_min}_{_d_max}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+df_all = df_all.drop(columns=["_файл"])
 
 # ============================================================
 # ФИЛЬТРЫ
