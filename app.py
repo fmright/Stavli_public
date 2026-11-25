@@ -71,6 +71,24 @@ REQUIRED_COLUMNS = [
 REQUIRED_IN_FILE = [c for c in REQUIRED_COLUMNS if c != "профит"]
 OPTIONAL_COLUMNS = ["линия", "формат", "период", "команда_ставки", "заметки"]
 
+# ============================================================
+# КАППЕРЫ: какой канал кому принадлежит.
+# Слева — название канала РОВНО как в боте, справа — имя каппера.
+# Новый канал → добавь строчку сюда. Канал, которого тут нет,
+# попадёт в «Без каппера» (дашборд покажет предупреждение).
+# ============================================================
+CAPPERS = {
+    "Ночная Америка": "Каппер 1",
+    "Канал для своих 2.0": "Каппер 1",
+    "Платные экспрессы": "Каппер 1",
+    "Сигнал / Лига ставок": "Каппер 1",
+    "Сигналы «Первый забьёт»": "Каппер 1",
+    "Бесплатные прогнозы": "Каппер 1",
+    "Индустрия Беттинга": "Каппер 2",
+    "ИБ закрытый": "Каппер 2",
+}
+NO_CAPPER = "Без каппера"
+
 
 # ============================================================
 # ЗАГРУЗКА И ПОДГОТОВКА
@@ -318,6 +336,21 @@ if len(frames) > 1:
 
 df_all = df_all.drop(columns=["_файл"])
 
+# Каппер по каналу. Сравниваем без учёта лишних пробелов и регистра,
+# чтобы «Индустрия беттинга» и «Индустрия Беттинга » тоже нашлись.
+_cappers_norm = {k.strip().lower(): v for k, v in CAPPERS.items()}
+df_all["каппер"] = (
+    df_all["канал"].astype(str).str.strip().str.lower()
+    .map(_cappers_norm).fillna(NO_CAPPER)
+)
+_unmapped = sorted(df_all.loc[df_all["каппер"] == NO_CAPPER, "канал"].dropna().unique())
+if _unmapped:
+    st.warning(
+        "👤 Эти каналы не привязаны ни к одному капперу и попадут в «Без каппера»: "
+        + ", ".join(f"**{c}**" for c in _unmapped)
+        + ". Добавь их в словарь `CAPPERS` в начале `app.py`."
+    )
+
 # ============================================================
 # ФИЛЬТРЫ
 # ============================================================
@@ -447,6 +480,7 @@ def multi(label, col):
     return st.sidebar.multiselect(label, options, default=[])
 
 
+f_cappers = multi("👤 Каппер", "каппер")
 f_channels = multi("Канал", "канал")
 f_sports = multi("Спорт", "спорт")
 f_leagues = multi("Лига", "лига")
@@ -512,7 +546,7 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
     start, end = date_range
     df = df[(df["дата"].dt.date >= start) & (df["дата"].dt.date <= end)]
 for col, selected in [
-    ("канал", f_channels), ("спорт", f_sports), ("лига", f_leagues),
+    ("каппер", f_cappers), ("канал", f_channels), ("спорт", f_sports), ("лига", f_leagues),
     ("тип_ставки", f_types), ("период", f_periods),
     ("команда_ставки", f_teams), ("результат", f_results),
 ]:
@@ -571,7 +605,8 @@ st.divider()
 # ============================================================
 # ТАБЫ
 # ============================================================
-tab_channels, tab_types, tab_heat, tab_sport, tab_combo, tab_kef, tab_teams, tab_table = st.tabs([
+tab_cappers, tab_channels, tab_types, tab_heat, tab_sport, tab_combo, tab_kef, tab_teams, tab_table = st.tabs([
+    "👤 Капперы",
     "📺 Каналы",
     "🎲 Типы ставок",
     "🔥 Канал × тип (тепло)",
@@ -630,6 +665,57 @@ def render_bar(df_in: pd.DataFrame, by: str, *, title: str = "", caption: str = 
 def _t(roi_text: str, winrate_text: str) -> str:
     """Хелпер: вернуть ROI-вариант текста (сигналы убраны, всегда реальные ставки)."""
     return roi_text
+
+
+with tab_cappers:
+    render_bar(df, "каппер",
+               title="ROI по капперам",
+               caption="Итог каждого каппера по всем его каналам вместе")
+
+    st.divider()
+
+    # Как менялась прибыль каждого каппера со временем — видно, растёт или сливает
+    st.subheader("Прибыль нарастающим итогом")
+    _daily = (df.groupby(["каппер", df["дата"].dt.date])["профит"].sum()
+                .reset_index().rename(columns={"дата": "день"}))
+    if len(_daily) == 0:
+        st.info("Нет данных для графика.")
+    else:
+        _daily = _daily.sort_values("день")
+        _daily["прибыль, ₽"] = _daily.groupby("каппер")["профит"].cumsum()
+        fig = px.line(_daily, x="день", y="прибыль, ₽", color="каппер", markers=True)
+        fig.add_hline(y=0, line_dash="dot", line_color="gray")
+        fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0),
+                          legend_title_text="")
+        # Только дни, без часов на оси
+        _span_days = (_daily["день"].max() - _daily["день"].min()).days
+        _step_days = 1 if _span_days <= 31 else 7
+        fig.update_xaxes(tickformat="%d.%m", dtick=86400000.0 * _step_days)
+        st.plotly_chart(fig, use_container_width=True, key="cappers_cumulative")
+
+    st.divider()
+
+    # Из каких каналов складывается итог каппера
+    st.subheader("Каналы внутри каппера")
+    st.caption("Какой канал тянет каппера вверх, а какой вниз")
+    _by = aggregate(df, ["каппер", "канал"])
+    if len(_by) == 0:
+        st.info("Нет данных.")
+    else:
+        _by = _by.sort_values(["каппер", "ROI%"], ascending=[True, False])
+        _by["надёжность"] = _by["ставок"].apply(reliability_marker)
+        _by["оборот"] = _by["оборот"].map(lambda x: f"{x:,.0f}".replace(",", " "))
+        _by["профит"] = _by["профит"].map(lambda x: f"{x:+,.0f}".replace(",", " "))
+        _by["ROI%"] = _by["ROI%"].map(lambda x: f"{x:+.1f}%")
+        st.dataframe(_by, use_container_width=True, hide_index=True, key="cappers_channels_df")
+
+    with st.expander("✏️ Как привязать канал к капперу"):
+        st.markdown(
+            "В начале `app.py` есть словарь `CAPPERS`: слева название канала "
+            "ровно как в боте, справа имя каппера. Добавил строчку, залил на гитхаб — "
+            "Streamlit пересобрался, и канал посчитался в нужного каппера. "
+            "Работает и для старых выгрузок: каппер вычисляется при загрузке, в файле его хранить не нужно."
+        )
 
 
 with tab_channels:
